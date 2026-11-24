@@ -39,7 +39,7 @@ jobs:
       - name: Build firmware
         working-directory: vial-qmk
         run: |
-          make keyboard_quantizer/kqb:default:zip
+          make keyboard_quantizer/kqb:default:nrfutil
 
       - name: Upload firmware
         uses: actions/upload-artifact@v7
