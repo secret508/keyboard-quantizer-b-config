@@ -10,10 +10,10 @@
 
 typedef enum {
     GESTURE_NONE = 0,
-    GESTURE_DOWN_RIGHT,
-    GESTURE_DOWN_LEFT,
-    GESTURE_UP_LEFT,
-    GESTURE_UP_RIGHT,
+    GESTURE_RIGHT,
+    GESTURE_LEFT,
+    GESTURE_UP,
+    GESTURE_DOWN,
 } gesture_id_t;
 
 typedef enum {
@@ -37,12 +37,25 @@ int      reset_flag                  = 0;
 #    define ENCODER_MODIFIER_TIMEOUT_MS 500
 #endif
 
+#ifndef GESTURE_THRESHOLD
+#    define GESTURE_THRESHOLD 30
+#endif
+
+#ifndef GESTURE_COOLDOWN_MS
+#    define GESTURE_COOLDOWN_MS 150
+#endif
+
+#ifndef SCROLL_SCALE
+#    define SCROLL_SCALE 4
+#endif
+
 static int16_t  gesture_move_x          = 0;
 static int16_t  gesture_move_y          = 0;
 static bool     gesture_wait            = false;
 static int16_t  wheel_move_v            = 0;
 static int16_t  wheel_move_h            = 0;
-static uint16_t mouse_gesture_threshold = 50;
+static uint16_t mouse_gesture_threshold = GESTURE_THRESHOLD;
+static uint16_t gesture_last_fired_ms   = 0;
 
 // Start gesture recognition
 static void gesture_start(void) {
@@ -50,6 +63,7 @@ static void gesture_start(void) {
     gesture_wait   = true;
     gesture_move_x = 0;
     gesture_move_y = 0;
+    gesture_last_fired_ms = timer_read() - GESTURE_COOLDOWN_MS;
 }
 
 void set_mouse_gesture_threshold(uint16_t val) {
@@ -59,21 +73,15 @@ void set_mouse_gesture_threshold(uint16_t val) {
 }
 
 gesture_id_t recognize_gesture(int16_t x, int16_t y) {
-    gesture_id_t gesture_id = 0;
-
     if (abs(x) + abs(y) < mouse_gesture_threshold) {
-        gesture_id = GESTURE_NONE;
-    } else if (x >= 0 && y >= 0) {
-        gesture_id = GESTURE_DOWN_RIGHT;
-    } else if (x < 0 && y >= 0) {
-        gesture_id = GESTURE_DOWN_LEFT;
-    } else if (x < 0 && y < 0) {
-        gesture_id = GESTURE_UP_LEFT;
-    } else if (x >= 0 && y < 0) {
-        gesture_id = GESTURE_UP_RIGHT;
+        return GESTURE_NONE;
     }
 
-    return gesture_id;
+    if (abs(x) >= abs(y)) {
+        return x >= 0 ? GESTURE_RIGHT : GESTURE_LEFT;
+    } else {
+        return y < 0 ? GESTURE_UP : GESTURE_DOWN;
+    }
 }
 
 static uint16_t dynamic_config_keymap_keycode_to_keycode(uint8_t layer, uint16_t keycode)
@@ -112,13 +120,19 @@ static int8_t get_mouse_scale(DYNAMIC_CONFIG_MOUSE_SCALE scale_type) {
 
 void process_gesture(uint8_t layer, gesture_id_t gesture_id) {
     switch (gesture_id) {
-        case GESTURE_DOWN_RIGHT ... GESTURE_UP_RIGHT: {
-            uint16_t keycode = dynamic_config_keymap_keycode_to_keycode(layer, (MATRIX_MSGES_ROW - 1) * 8 + gesture_id - GESTURE_DOWN_RIGHT);
-            if (keycode == MATRIX_MSGES_ROW * 8 + gesture_id - GESTURE_DOWN_RIGHT) {
+        case GESTURE_RIGHT ... GESTURE_DOWN: {
+            uint16_t keycode = dynamic_config_keymap_keycode_to_keycode(
+                layer,
+                (MATRIX_MSGES_ROW - 1) * 8 + gesture_id - GESTURE_RIGHT
+            );
+
+            if (keycode == MATRIX_MSGES_ROW * 8 + gesture_id - GESTURE_RIGHT) {
                 return;
             }
+
             vial_keycode_tap(keycode);
         } break;
+
         default:
             break;
     }
@@ -235,38 +249,79 @@ void mouse_report_hook(mouse_parse_result_t const* report) {
         is_encoder_action = false;
     }
 
-    //
-    // Assign mouse movement
+        //
+    // Assign mouse movement / Recognize gesture
     //
     report_mouse_t mouse = pointing_device_get_report();
 
-    if (scaled.x != 0 && ms_left_map == KC_MS_LEFT) {
-        mouse_send_flag = true;
-        mouse.x += scaled.x;
-    } else if (scaled.xh != 0 && ms_left_map == KC_MS_WH_LEFT) {
-        // remap x to h, and h will send as mouse report
-        mouse_send_flag = true;
-        mouse.h += scaled.xh;
-    }
+    if (gesture_wait) {
+        if (ms_left_map == KC_MS_WH_LEFT ||
+            ms_up_map == KC_MS_WH_UP) {
 
-    if (scaled.y != 0 && ms_up_map == KC_MS_UP) {
-        mouse_send_flag = true;
-        mouse.y += scaled.y;
-    } else if (scaled.yv != 0 && ms_up_map == KC_MS_WH_UP) {
-        // remap y to v, and v will send as mouse report
-        mouse_send_flag = true;
-        mouse.v -= scaled.yv;
+            // Scroll layer
+            if (scaled.x != 0 && ms_left_map == KC_MS_WH_LEFT) {
+                mouse_send_flag = true;
+                mouse.h += scaled.x / SCROLL_SCALE;
+            }
+
+            if (scaled.y != 0 && ms_up_map == KC_MS_WH_UP) {
+                mouse_send_flag = true;
+                mouse.v -= scaled.y / SCROLL_SCALE;
+            }
+
+        } else {
+            // Gesture mode: freeze cursor
+            gesture_move_x += scaled.x;
+            gesture_move_y += scaled.y;
+
+            gesture_id_t gesture_id =
+                recognize_gesture(gesture_move_x, gesture_move_y);
+
+            if (gesture_id != GESTURE_NONE) {
+                if (timer_elapsed(gesture_last_fired_ms) > GESTURE_COOLDOWN_MS) {
+                    uint8_t layer = 0;
+
+                    for (int8_t i = 15; i > 0; i--) {
+                        if (layer_state & (1UL << i)) {
+                            layer = i;
+                        break;
+                        }
+                    }
+
+                process_gesture(layer, gesture_id);
+                gesture_last_fired_ms = timer_read();
+                }
+
+            gesture_move_x = 0;
+            gesture_move_y = 0;
+            }
+        }
+    } else {
+        // Normal mouse movement
+        if (scaled.x != 0 && ms_left_map == KC_MS_LEFT) {
+            mouse_send_flag = true;
+            mouse.x += scaled.x;
+        } else if (scaled.x != 0 && ms_left_map == KC_MS_WH_LEFT) {
+            mouse_send_flag = true;
+            mouse.h += scaled.x;
+        } else if (scaled.xh != 0 && ms_left_map == KC_MS_WH_LEFT) {
+            mouse_send_flag = true;
+            mouse.h += scaled.xh;
+        }
+
+        if (scaled.y != 0 && ms_up_map == KC_MS_UP) {
+            mouse_send_flag = true;
+            mouse.y += scaled.y;
+        } else if (scaled.y != 0 && ms_up_map == KC_MS_WH_UP) {
+            mouse_send_flag = true;
+            mouse.v -= scaled.y;
+        } else if (scaled.yv != 0 && ms_up_map == KC_MS_WH_UP) {
+            mouse_send_flag = true;
+            mouse.v -= scaled.yv;
+        }
     }
 
     pointing_device_set_report(mouse);
-
-    //
-    // Save movement to recognize gesture
-    //
-    if (gesture_wait) {
-        gesture_move_x += scaled.x;
-        gesture_move_y += scaled.y;
-    }
 }
 
 bool process_record_mouse(uint16_t keycode, keyrecord_t* record) {
@@ -332,26 +387,18 @@ bool process_record_mouse(uint16_t keycode, keyrecord_t* record) {
 }
 
 void post_process_record_mouse(uint16_t keycode, keyrecord_t* record) {
-    if (keycode >= QK_MOMENTARY && keycode <= QK_MOMENTARY_MAX) {
-        if (record->event.pressed && gesture_wait == false) {
-            gesture_start();
+    if ((keycode >= QK_LAYER_TAP && keycode <= QK_LAYER_TAP_MAX) ||
+        (keycode >= QK_MOMENTARY && keycode <= QK_MOMENTARY_MAX)) {
+        if (!record->event.pressed && gesture_wait) {
+            gesture_wait = false;
+            gesture_move_x = 0;
+            gesture_move_y = 0;
         }
     }
 
-    if ((keycode >= QK_LAYER_TAP && keycode <= QK_LAYER_TAP_MAX) || (keycode >= QK_MOMENTARY && keycode <= QK_MOMENTARY_MAX)) {
-        if ((!record->event.pressed) && gesture_wait == true) {
-            gesture_wait            = false;
-            gesture_id_t gesture_id = recognize_gesture(gesture_move_x, gesture_move_y);
-
-            uint8_t layer = 0;
-            if ((keycode >= QK_LAYER_TAP && keycode <= QK_LAYER_TAP_MAX)) {
-                layer = QK_LAYER_TAP_GET_LAYER(keycode);
-            } else {
-                layer = QK_MOMENTARY_GET_LAYER(keycode);
-            }
-
-            process_gesture(layer, gesture_id);
-            dprintf("id:%d x:%d,y:%d\n", gesture_id, gesture_move_x, gesture_move_y);
+    if (keycode >= QK_MOMENTARY && keycode <= QK_MOMENTARY_MAX) {
+        if (record->event.pressed && gesture_wait == false) {
+            gesture_start();
         }
     }
 }
